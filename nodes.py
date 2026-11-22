@@ -109,6 +109,7 @@ class H3MPSAttentionProfiler:
 class H3MPSProfilerReport:
     CATEGORY = "H3 MPS Accelerator"
     FUNCTION = "report"
+    OUTPUT_NODE = True
     RETURN_TYPES = (ANY, "STRING")
     RETURN_NAMES = ("signal", "report")
 
