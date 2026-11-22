@@ -4,8 +4,10 @@ from profiler import make_profile_override, report_session
 
 
 class FakeTensor:
-    def __init__(self, shape):
+    def __init__(self, shape, device="mps:0", dtype="torch.bfloat16"):
         self.shape = shape
+        self.device = device
+        self.dtype = dtype
 
 
 class ProfilerTests(unittest.TestCase):
@@ -18,10 +20,35 @@ class ProfilerTests(unittest.TestCase):
             return "result"
 
         wrapped = make_profile_override(session="test", previous=None)
-        self.assertEqual(wrapped(dense, q, k, v, 8), "result")
+        options = {"sol_block": 7, "sigmas": [2.5]}
+        self.assertEqual(
+            wrapped(dense, q, k, v, 8, transformer_options=options),
+            "result",
+        )
         report = report_session("test")
         self.assertIn('"attention_calls": 1', report)
         self.assertIn('"max_tokens": 128', report)
+        self.assertIn('"7": 1', report)
+        self.assertIn('"2.5": 1', report)
+        self.assertIn('"mps:0": 1', report)
+        self.assertIn('"torch.bfloat16": 1', report)
+
+    def test_records_memory_peak(self):
+        q = FakeTensor((1, 32, 16))
+        values = iter((1024, 4096))
+
+        def dense(*_args, **_kwargs):
+            return "ok"
+
+        wrapped = make_profile_override(
+            session="memory",
+            previous=None,
+            memory_probe=lambda: next(values),
+        )
+        self.assertEqual(wrapped(dense, q, q, q, 2), "ok")
+        # The profiler probes after the call; this first report therefore sees
+        # the first supplied value.
+        self.assertIn('"peak_mps_allocated_mb": 0.0', report_session("memory"))
 
     def test_chains_existing_override(self):
         q = FakeTensor((1, 64, 32))

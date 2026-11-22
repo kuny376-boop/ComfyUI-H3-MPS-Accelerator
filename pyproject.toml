@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-h3-mps-accelerator"
-version = "0.1.0"
+version = "0.2.0"
 description = "Experimental MiniMax H3 profiling and acceleration for Apple Silicon"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }

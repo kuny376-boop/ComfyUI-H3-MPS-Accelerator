@@ -94,10 +94,14 @@ class H3MPSAttentionProfiler:
         sync = None
         if exact_mps_timing and mm.get_torch_device().type == "mps":
             sync = torch.mps.synchronize
+        memory_probe = None
+        if mm.get_torch_device().type == "mps" and hasattr(torch.mps, "current_allocated_memory"):
+            memory_probe = torch.mps.current_allocated_memory
         options["optimized_attention_override"] = make_profile_override(
             session=name,
             previous=previous,
             synchronize=sync,
+            memory_probe=memory_probe,
         )
         return patched, name
 

@@ -1,8 +1,8 @@
 # ComfyUI H3 MPS Accelerator
 
 Experimental Apple Silicon acceleration and measurement nodes for MiniMax H3.
-This project is an optional companion to ComfyUI-Banzhang-All; it does not
-modify or vendor the Banzhang node pack.
+The project is workflow-agnostic: it patches a ComfyUI `MODEL` object and does
+not modify or vendor ComfyUI or any other custom-node package.
 
 ## Current milestone: measurement and safety
 
@@ -11,7 +11,8 @@ The first milestone deliberately does not approximate model output. It adds:
 - **H3 MPS Runtime Guard**: rejects unsafe H3/MPS launch combinations and is a
   pass-through on Windows.
 - **H3 MPS Attention Profiler**: wraps the active attention backend, including
-  SolAttn when it is already installed, and records call geometry and time.
+  SolAttn when it is already installed, and records call geometry and time,
+  H3 block index, diffusion sigma, dtype/device and peak MPS allocation.
 - **H3 MPS Profiler Report**: runs after a connected sampler output and prints
   JSON suitable for benchmark comparisons.
 
