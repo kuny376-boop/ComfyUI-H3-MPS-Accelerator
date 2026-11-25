@@ -57,6 +57,7 @@ class ConvRotMetal:
         self.lib = None
         self.disabled = False
         self.checked = set()
+        self.rejected = set()
         self.hits = 0
         self.fallbacks = 0
         self.reported = set()
@@ -111,10 +112,13 @@ class ConvRotMetal:
                          str(scale.device), group, code, q.storage_offset(),
                          scale.storage_offset(), q.is_contiguous(), scale.is_contiguous()))
             return func(*args, **kwargs)
+        key = (tuple(q.shape), tuple(scale.shape), str(q.device))
+        if key in self.rejected:
+            self.fallbacks += 1
+            return func(*args, **kwargs)
         try:
             if self.lib is None:
                 self.lib = torch.mps.compile_shader(_SHADER)
-            key = (tuple(q.shape), tuple(scale.shape))
             if key not in self.checked:
                 # Sample beginning, middle and end; keep complete rotation groups.
                 n = min(8, q.shape[0])
@@ -147,7 +151,10 @@ class ConvRotMetal:
                 logging.info("[H3 ConvRot] sample passed=%s relative_l2=%.9g max_abs=%.9g mismatch=%s/%s local_ok=%s",
                              passed, rel, max_abs, (a != b).sum().item(), a.numel(), local_ok)
                 if not passed:
-                    raise RuntimeError("ConvRot BF16 tolerance sample mismatch")
+                    self.rejected.add(key)
+                    self.fallbacks += 1
+                    logging.warning("[H3 ConvRot] rejected shape=%s; other shapes remain enabled", key)
+                    return func(*args, **kwargs)
                 self.checked.add(key)
             out = self._compute(q, scale)
             self.hits += 1
