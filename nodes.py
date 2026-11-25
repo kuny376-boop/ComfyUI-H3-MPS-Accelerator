@@ -202,7 +202,7 @@ class H3MPSQuantAccelerator:
     def INPUT_TYPES(cls):
         return {"required": {
             "model": ("MODEL",),
-            "backend": (["observe", "chunked", "convrot_metal"], {"default": "observe"}),
+            "backend": (["observe", "chunked", "convrot_metal", "convrot_direct", "native"], {"default": "observe"}),
             "chunk_mib": ("INT", {"default": 128, "min": 64, "max": 512, "step": 64}),
         }}
 
@@ -220,7 +220,10 @@ class H3MPSQuantAccelerator:
         previous = patched.model_options.get("model_function_wrapper")
         lock = _H3_QUANT_LOCK
         from .convrot_metal import ConvRotMetal
-        convrot = ConvRotMetal() if backend == "convrot_metal" else None
+        convrot = ConvRotMetal() if backend in ("convrot_metal", "convrot_direct") else None
+
+        if backend == "native":
+            return (model,)
 
         def wrapper(apply_model, params):
             with lock:
@@ -235,7 +238,12 @@ class H3MPSQuantAccelerator:
 
                     hits, fallbacks = convrot.hits, convrot.fallbacks
                     try:
-                        with ConvRotOnly():
+                        if backend == "convrot_direct":
+                            from .convrot_direct import direct_scope
+                            scope = direct_scope(convrot)
+                        else:
+                            scope = ConvRotOnly()
+                        with scope:
                             if previous is not None:
                                 return previous(apply_model, params)
                             return apply_model(params["input"], params["timestep"], **params["c"])
