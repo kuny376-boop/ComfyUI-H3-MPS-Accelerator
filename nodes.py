@@ -190,7 +190,127 @@ class H3MPSMemoryManager:
         return (conditioning,)
 
 
+
+class H3MPSQuantAccelerator:
+    """Experimental row-chunked INT8 linear; scoped to an H3 model call."""
+    CATEGORY = "H3 MPS Accelerator"
+    FUNCTION = "apply"
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "backend": (["observe", "chunked"], {"default": "observe"}),
+            "chunk_mib": ("INT", {"default": 128, "min": 64, "max": 512, "step": 64}),
+        }}
+
+    def apply(self, model, backend, chunk_mib):
+        import functools
+        import inspect
+        import logging
+        import threading
+        import comfy_kitchen as ck
+
+        if mm.get_torch_device().type != "mps" or not _is_h3(model):
+            return (model,)
+        patched = model.clone()
+        previous = patched.model_options.get("model_function_wrapper")
+        lock = _H3_QUANT_LOCK
+
+        def wrapper(apply_model, params):
+            with lock:
+                original = getattr(ck, "int8_linear", None)
+                def run():
+                    if previous is not None:
+                        return previous(apply_model, params)
+                    return apply_model(params["input"], params["timestep"], **params["c"])
+                if not callable(original):
+                    logging.warning("[H3 Quant] int8_linear unavailable")
+                    return run()
+                try:
+                    signature = inspect.signature(original)
+                except (TypeError, ValueError):
+                    return run()
+                owner = threading.get_ident()
+                counts = {"calls": 0, "chunked": 0, "skipped": 0}
+                checked = {}
+
+                @functools.wraps(original)
+                def linear(*args, **kwargs):
+                    if threading.get_ident() != owner:
+                        return original(*args, **kwargs)
+                    counts["calls"] += 1
+                    bound = signature.bind(*args, **kwargs)
+                    bound.apply_defaults()
+                    a = bound.arguments
+                    x, w = a.get("x"), a.get("weight")
+                    if counts["calls"] <= 4:
+                        logging.info("[H3 Quant] call %s x=%s weight=%s act=%s",
+                                     counts["calls"], getattr(x, "shape", None),
+                                     getattr(w, "shape", None), a.get("input_act"))
+                    if (backend != "chunked" or not isinstance(x, torch.Tensor)
+                            or not isinstance(w, torch.Tensor) or x.device.type != "mps"
+                            or x.ndim != 2 or w.ndim != 2 or w.dtype != torch.int8
+                            or a.get("weight_tiled", False) or a.get("residual") is not None
+                            or a.get("residual_scale") is not None
+                            or a.get("input_act") not in (None, "swiglu")
+                            or w.shape[0] == 0):
+                        counts["skipped"] += 1
+                        return original(*args, **kwargs)
+                    rows = max(1, (chunk_mib << 20) // (4 * w.shape[0]))
+                    if x.shape[0] <= rows:
+                        counts["skipped"] += 1
+                        return original(*args, **kwargs)
+
+                    def part(lo, hi):
+                        call = signature.bind(*args, **kwargs)
+                        call.arguments["x"] = x[lo:hi]
+                        return original(*call.args, **call.kwargs)
+
+                    key = (tuple(w.shape), x.dtype, a.get("out_dtype"),
+                           a.get("input_act"), a.get("convrot"), a.get("convrot_groupsize"))
+                    if key not in checked:
+                        # Compare a small native projection against two row chunks.
+                        ref = part(0, 32)
+                        probe = torch.cat((part(0, 16), part(16, 32)), dim=0)
+                        checked[key] = bool(torch.equal(ref, probe))
+                        logging.info("[H3 Quant] exact small-row check %s: %s", key, checked[key])
+                        del ref, probe
+                    if not checked[key]:
+                        counts["skipped"] += 1
+                        return original(*args, **kwargs)
+                    out = None
+                    for lo in range(0, x.shape[0], rows):
+                        hi = min(lo + rows, x.shape[0])
+                        block = part(lo, hi)
+                        if out is None:
+                            out = torch.empty((x.shape[0], block.shape[-1]),
+                                              dtype=block.dtype, device=block.device)
+                        out[lo:hi].copy_(block)
+                        del block
+                    counts["chunked"] += 1
+                    return out
+
+                ck.int8_linear = linear
+                try:
+                    return run()
+                finally:
+                    if ck.int8_linear is linear:
+                        ck.int8_linear = original
+                    logging.info("[H3 Quant] backend=%s chunk_mib=%s %s",
+                                 backend, chunk_mib, counts)
+
+        patched.set_model_unet_function_wrapper(wrapper)
+        return (patched,)
+
+
+import threading as _threading
+_H3_QUANT_LOCK = _threading.RLock()
+
 NODE_CLASS_MAPPINGS = {
+    "H3MPSQuantAccelerator": H3MPSQuantAccelerator,
     "H3MPSMemoryManager": H3MPSMemoryManager,
     "H3MPSRuntimeGuard": H3MPSRuntimeGuard,
     "H3MPSAttentionProfiler": H3MPSAttentionProfiler,
@@ -198,6 +318,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "H3MPSQuantAccelerator": "H3 MPS Quant Accelerator",
     "H3MPSMemoryManager": "H3 MPS Memory Manager",
     "H3MPSRuntimeGuard": "H3 MPS Runtime Guard",
     "H3MPSAttentionProfiler": "H3 MPS Attention Profiler",
