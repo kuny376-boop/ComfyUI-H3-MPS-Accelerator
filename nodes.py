@@ -202,7 +202,7 @@ class H3MPSQuantAccelerator:
     def INPUT_TYPES(cls):
         return {"required": {
             "model": ("MODEL",),
-            "backend": (["observe", "chunked"], {"default": "observe"}),
+            "backend": (["observe", "chunked", "convrot_metal"], {"default": "observe"}),
             "chunk_mib": ("INT", {"default": 128, "min": 64, "max": 512, "step": 64}),
         }}
 
@@ -219,6 +219,8 @@ class H3MPSQuantAccelerator:
         patched = model.clone()
         previous = patched.model_options.get("model_function_wrapper")
         lock = _H3_QUANT_LOCK
+        from .convrot_metal import ConvRotMetal
+        convrot = ConvRotMetal() if backend == "convrot_metal" else None
 
         def wrapper(apply_model, params):
             with lock:
@@ -243,6 +245,9 @@ class H3MPSQuantAccelerator:
                 class QuantObserve(TorchDispatchMode):
                     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
                         name = str(func)
+                        if convrot is not None and name == "comfy_kitchen.dequantize_int8_convrot_weight_dtype.default":
+                            dispatch_counts[name] = dispatch_counts.get(name, 0) + 1
+                            return convrot.call(func, args, kwargs or {})
                         if "comfy_kitchen" in name or "int_mm" in name or "scaled_mm" in name:
                             dispatch_counts[name] = dispatch_counts.get(name, 0) + 1
                         return func(*args, **(kwargs or {}))
@@ -315,6 +320,8 @@ class H3MPSQuantAccelerator:
                     logging.info("[H3 Quant] backend=%s chunk_mib=%s %s",
                                  backend, chunk_mib, counts)
                     logging.info("[H3 Quant] dispatch=%s skipped_reasons=%s", dispatch_counts, reasons)
+                    if convrot is not None:
+                        logging.info("[H3 ConvRot] cumulative hits=%s fallback=%s disabled=%s", convrot.hits, convrot.fallbacks, convrot.disabled)
 
         patched.set_model_unet_function_wrapper(wrapper)
         return (patched,)
