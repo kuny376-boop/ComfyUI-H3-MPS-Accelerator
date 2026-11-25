@@ -212,6 +212,7 @@ class H3MPSQuantAccelerator:
         import logging
         import threading
         import comfy_kitchen as ck
+        from torch.utils._python_dispatch import TorchDispatchMode
 
         if mm.get_torch_device().type != "mps" or not _is_h3(model):
             return (model,)
@@ -236,6 +237,20 @@ class H3MPSQuantAccelerator:
                 owner = threading.get_ident()
                 counts = {"calls": 0, "chunked": 0, "skipped": 0}
                 checked = {}
+                dispatch_counts = {}
+                reasons = {}
+
+                class QuantObserve(TorchDispatchMode):
+                    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                        name = str(func)
+                        if "comfy_kitchen" in name or "int_mm" in name or "scaled_mm" in name:
+                            dispatch_counts[name] = dispatch_counts.get(name, 0) + 1
+                        return func(*args, **(kwargs or {}))
+
+                def skip(reason, args, kwargs):
+                    counts["skipped"] += 1
+                    reasons[reason] = reasons.get(reason, 0) + 1
+                    return original(*args, **kwargs)
 
                 @functools.wraps(original)
                 def linear(*args, **kwargs):
@@ -255,14 +270,12 @@ class H3MPSQuantAccelerator:
                             or x.ndim != 2 or w.ndim != 2 or w.dtype != torch.int8
                             or a.get("weight_tiled", False) or a.get("residual") is not None
                             or a.get("residual_scale") is not None
-                            or a.get("input_act") not in (None, "swiglu")
+                            or a.get("input_act") not in (None, "swiglu", "rms_norm")
                             or w.shape[0] == 0):
-                        counts["skipped"] += 1
-                        return original(*args, **kwargs)
+                        return skip("observe_or_unsupported", args, kwargs)
                     rows = max(1, (chunk_mib << 20) // (4 * w.shape[0]))
                     if x.shape[0] <= rows:
-                        counts["skipped"] += 1
-                        return original(*args, **kwargs)
+                        return skip("below_budget", args, kwargs)
 
                     def part(lo, hi):
                         call = signature.bind(*args, **kwargs)
@@ -279,8 +292,7 @@ class H3MPSQuantAccelerator:
                         logging.info("[H3 Quant] exact small-row check %s: %s", key, checked[key])
                         del ref, probe
                     if not checked[key]:
-                        counts["skipped"] += 1
-                        return original(*args, **kwargs)
+                        return skip("numeric_check", args, kwargs)
                     out = None
                     for lo in range(0, x.shape[0], rows):
                         hi = min(lo + rows, x.shape[0])
@@ -295,12 +307,14 @@ class H3MPSQuantAccelerator:
 
                 ck.int8_linear = linear
                 try:
-                    return run()
+                    with QuantObserve():
+                        return run()
                 finally:
                     if ck.int8_linear is linear:
                         ck.int8_linear = original
                     logging.info("[H3 Quant] backend=%s chunk_mib=%s %s",
                                  backend, chunk_mib, counts)
+                    logging.info("[H3 Quant] dispatch=%s skipped_reasons=%s", dispatch_counts, reasons)
 
         patched.set_model_unet_function_wrapper(wrapper)
         return (patched,)
