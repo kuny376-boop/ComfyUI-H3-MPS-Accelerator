@@ -35,6 +35,13 @@ class ConvRotMetal:
         self.checked = set()
         self.hits = 0
         self.fallbacks = 0
+        self.reported = set()
+
+    def _report(self, reason, detail):
+        key = (reason, detail)
+        if key not in self.reported and len(self.reported) < 24:
+            self.reported.add(key)
+            logging.warning("[H3 ConvRot] fallback reason=%s detail=%s", reason, detail)
 
     def _compute(self, q, scale):
         out = torch.empty_like(q, dtype=torch.bfloat16)
@@ -48,17 +55,32 @@ class ConvRotMetal:
             return func(*args, **kwargs)
         if kwargs or len(args) != 4:
             self.fallbacks += 1
+            self._report("signature", (len(args), tuple(kwargs)))
             return func(*args, **kwargs)
         q, scale, group, code = args
-        if not (isinstance(q, torch.Tensor) and isinstance(scale, torch.Tensor)
-                and q.device.type == "mps" and scale.device == q.device
-                and q.dtype == torch.int8 and q.ndim == 2
-                and q.is_contiguous() and scale.is_contiguous()
-                and q.storage_offset() == 0 and scale.storage_offset() == 0
-                and scale.dtype == torch.float32 and scale.numel() == 1
-                and group == 256 and code == 2 and q.shape[1] % 256 == 0
-                and 0 < q.numel() < 2**31):
+        if not isinstance(q, torch.Tensor) or not isinstance(scale, torch.Tensor):
             self.fallbacks += 1
+            self._report("types", (type(q).__name__, type(scale).__name__))
+            return func(*args, **kwargs)
+        checks = {
+            "device": q.device.type == "mps" and scale.device == q.device,
+            "weight_dtype": q.dtype == torch.int8,
+            "rank": q.ndim == 2,
+            "contiguous": q.is_contiguous() and scale.is_contiguous(),
+            "offset": q.storage_offset() == 0 and scale.storage_offset() == 0,
+            "scale_dtype": scale.dtype == torch.float32,
+            "scale_size": scale.numel() == 1,
+            "group": group == 256,
+            "output_dtype": code == 2,
+            "dimensions": q.ndim == 2 and q.shape[1] % 256 == 0 and 0 < q.numel() < 2**31,
+        }
+        failed = tuple(k for k, v in checks.items() if not v)
+        if failed:
+            self.fallbacks += 1
+            self._report("guards", (failed, tuple(q.shape), str(q.dtype),
+                         str(q.device), tuple(scale.shape), str(scale.dtype),
+                         str(scale.device), group, code, q.storage_offset(),
+                         scale.storage_offset(), q.is_contiguous(), scale.is_contiguous()))
             return func(*args, **kwargs)
         try:
             if self.lib is None:
