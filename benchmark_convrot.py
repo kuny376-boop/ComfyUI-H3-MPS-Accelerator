@@ -3,6 +3,7 @@
 Not installed as a model patch. Run directly on the target Mac first.
 """
 import argparse
+import logging
 import time
 import torch
 import torch.nn.functional as F
@@ -72,5 +73,6 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     import comfy_kitchen
     main()
