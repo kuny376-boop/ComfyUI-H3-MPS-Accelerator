@@ -11,7 +11,8 @@ kernel void convrot256(const device char* q [[buffer(0)]],
                        uint i [[thread_position_in_grid]],
                        uint t [[thread_position_in_threadgroup]]) {
     threadgroup float a[256];
-    a[t] = float(q[i]) * scale[0];
+    // Integer butterfly is exact for 256 signed INT8 values.
+    a[t] = float(q[i]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = 1; stride < 256; stride *= 4) {
         uint digit = (t / stride) % 4;
@@ -23,7 +24,7 @@ kernel void convrot256(const device char* q [[buffer(0)]],
         a[t] = v;
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    out[i] = bfloat(a[t] * 0.0625f);
+    out[i] = bfloat((a[t] * 0.0625f) * scale[0]);
 }
 """
 
@@ -43,6 +44,7 @@ class ConvRotMetal:
 
     def call(self, func, args, kwargs):
         if self.disabled:
+            self.fallbacks += 1
             return func(*args, **kwargs)
         if kwargs or len(args) != 4:
             self.fallbacks += 1
@@ -67,7 +69,13 @@ class ConvRotMetal:
                 ref = func(sample, scale, group, code)
                 got = self._compute(sample, scale)
                 # Strict gate: a different summation order may fail.
-                if not torch.equal(ref, got):
+                diff = got.float() - ref.float()
+                rel = (diff.norm() / ref.float().norm().clamp_min(1e-12)).item()
+                max_abs = diff.abs().max().item()
+                equal = torch.equal(ref, got)
+                logging.warning("[H3 ConvRot] sample exact=%s relative_l2=%.9g max_abs=%.9g mismatch=%s/%s",
+                                equal, rel, max_abs, (ref != got).sum().item(), ref.numel())
+                if not equal:
                     raise RuntimeError("ConvRot BF16 exact sample mismatch")
                 self.checked.add(key)
                 logging.info("[H3 ConvRot] exact sample passed shape=%s", key)
@@ -76,5 +84,6 @@ class ConvRotMetal:
             return out
         except Exception as exc:
             self.disabled = True
+            self.fallbacks += 1
             logging.warning("[H3 ConvRot] disabled; native fallback: %r", exc)
             return func(*args, **kwargs)
