@@ -28,6 +28,7 @@ def main():
     p.add_argument("--in-features", type=int, default=2048)
     p.add_argument("--out-features", type=int, default=6144)
     p.add_argument("--repeats", type=int, default=3)
+    p.add_argument("--per-row", action="store_true")
     a = p.parse_args()
     if not torch.backends.mps.is_available():
         raise RuntimeError("MPS required")
@@ -37,6 +38,8 @@ def main():
     q = torch.randint(-127, 128, (a.out_features, a.in_features), dtype=torch.int8).to("mps")
     x = torch.randn(a.tokens, a.in_features, dtype=torch.float32).to("mps", dtype=torch.bfloat16)
     scale = torch.tensor(0.0037, device="mps", dtype=torch.float32)
+    if a.per_row:
+        scale = (0.001 + 0.006 * torch.rand(a.out_features, 1)).to("mps")
     op = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight_dtype.default
     def native():
         return F.linear(x, op(q, scale, 256, 2))
