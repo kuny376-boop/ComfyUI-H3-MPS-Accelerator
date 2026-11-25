@@ -26,6 +26,29 @@ kernel void convrot256(const device char* q [[buffer(0)]],
     }
     out[i] = bfloat((a[t] * 0.0625f) * scale[0]);
 }
+kernel void convrot256_rows(const device char* q [[buffer(0)]],
+                       const device float* scale [[buffer(1)]],
+                       device bfloat* out [[buffer(2)]],
+                       uint2 pos [[thread_position_in_grid]],
+                       uint2 dims [[threads_per_grid]],
+                       uint t [[thread_position_in_threadgroup]]) {
+    uint i = pos.y * dims.x + pos.x;
+    threadgroup float a[256];
+    // Integer butterfly is exact for 256 signed INT8 values.
+    a[t] = float(q[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1; stride < 256; stride *= 4) {
+        uint digit = (t / stride) % 4;
+        uint base = t - digit * stride;
+        float v = (a[base] + a[base+stride] +
+                   a[base+2*stride] + a[base+3*stride])
+                   - 2.0f * a[base+(3-digit)*stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        a[t] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    out[i] = bfloat((a[t] * 0.0625f) * scale[pos.y]);
+}
 """
 
 class ConvRotMetal:
@@ -45,8 +68,13 @@ class ConvRotMetal:
 
     def _compute(self, q, scale):
         out = torch.empty_like(q, dtype=torch.bfloat16)
-        self.lib.convrot256(q, scale.reshape(1), out,
-                            threads=(q.numel(),), group_size=(256,))
+        if scale.numel() == 1:
+            self.lib.convrot256(q, scale.reshape(1), out,
+                                threads=(q.numel(),), group_size=(256,))
+        else:
+            self.lib.convrot256_rows(q, scale.reshape(-1), out,
+                                     threads=(q.shape[1], q.shape[0]),
+                                     group_size=(256, 1))
         return out
 
     def call(self, func, args, kwargs):
@@ -69,7 +97,7 @@ class ConvRotMetal:
             "contiguous": q.is_contiguous() and scale.is_contiguous(),
             "offset": q.storage_offset() == 0 and scale.storage_offset() == 0,
             "scale_dtype": scale.dtype == torch.float32,
-            "scale_size": scale.numel() == 1,
+            "scale_size": scale.numel() == 1 or (q.ndim == 2 and tuple(scale.shape) == (q.shape[0], 1)),
             "group": group == 256,
             "output_dtype": code == 2,
             "dimensions": q.ndim == 2 and q.shape[1] % 256 == 0 and 0 < q.numel() < 2**31,
@@ -85,14 +113,16 @@ class ConvRotMetal:
         try:
             if self.lib is None:
                 self.lib = torch.mps.compile_shader(_SHADER)
-            key = (tuple(q.shape), float(scale.item()))
+            key = (tuple(q.shape), tuple(scale.shape))
             if key not in self.checked:
                 # Sample beginning, middle and end; keep complete rotation groups.
                 n = min(8, q.shape[0])
                 starts = sorted({0, (q.shape[0] - n) // 2, q.shape[0] - n})
                 sample = torch.cat([q[i:i+n] for i in starts], dim=0).contiguous()
-                ref = func(sample, scale, group, code)
-                got = self._compute(sample, scale)
+                sample_scale = (scale if scale.numel() == 1 else
+                                torch.cat([scale[i:i+n] for i in starts], dim=0).contiguous())
+                ref = func(sample, sample_scale, group, code)
+                got = self._compute(sample, sample_scale)
                 if ref.shape != got.shape or ref.dtype != got.dtype:
                     raise RuntimeError("ConvRot shape/dtype mismatch")
                 # CPU float64 diagnostics avoid MPS reduction rounding.
