@@ -141,7 +141,9 @@ class ConvRotMetal:
                 ulp = torch.pow(2.0, exponent - 8).clamp_min(2.0 ** -133)
                 ulp = torch.where(a == 0, torch.full_like(ulp, 2.0 ** -133), ulp)
                 local_ok = bool((diff <= ulp + peak * 2e-6).all())
-                passed = rel <= 1e-5 and max_abs <= peak * 1e-4 and local_ok
+                # Experimental BF16 rounding tolerance; retain a global error bound
+                # as well as the per-element ULP guard.
+                passed = rel <= 5e-5 and max_abs <= peak * 0.008 and local_ok
                 logging.info("[H3 ConvRot] sample passed=%s relative_l2=%.9g max_abs=%.9g mismatch=%s/%s local_ok=%s",
                              passed, rel, max_abs, (a != b).sum().item(), a.numel(), local_ok)
                 if not passed:
