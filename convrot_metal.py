@@ -63,22 +63,37 @@ class ConvRotMetal:
         try:
             if self.lib is None:
                 self.lib = torch.mps.compile_shader(_SHADER)
-            key = tuple(q.shape)
+            key = (tuple(q.shape), float(scale.item()))
             if key not in self.checked:
-                sample = q[:min(8, q.shape[0])].clone()
+                # Sample beginning, middle and end; keep complete rotation groups.
+                n = min(8, q.shape[0])
+                starts = sorted({0, (q.shape[0] - n) // 2, q.shape[0] - n})
+                sample = torch.cat([q[i:i+n] for i in starts], dim=0).contiguous()
                 ref = func(sample, scale, group, code)
                 got = self._compute(sample, scale)
-                # Strict gate: a different summation order may fail.
-                diff = got.float() - ref.float()
-                rel = (diff.norm() / ref.float().norm().clamp_min(1e-12)).item()
-                max_abs = diff.abs().max().item()
-                equal = torch.equal(ref, got)
-                logging.warning("[H3 ConvRot] sample exact=%s relative_l2=%.9g max_abs=%.9g mismatch=%s/%s",
-                                equal, rel, max_abs, (ref != got).sum().item(), ref.numel())
-                if not equal:
-                    raise RuntimeError("ConvRot BF16 exact sample mismatch")
+                if ref.shape != got.shape or ref.dtype != got.dtype:
+                    raise RuntimeError("ConvRot shape/dtype mismatch")
+                # CPU float64 diagnostics avoid MPS reduction rounding.
+                a = ref.detach().cpu().double()
+                b = got.detach().cpu().double()
+                if not bool(torch.isfinite(a).all() and torch.isfinite(b).all()):
+                    raise RuntimeError("ConvRot nonfinite sample")
+                diff = (a - b).abs()
+                rel = (diff.norm() / a.norm().clamp_min(1e-30)).item()
+                peak = a.abs().max().item()
+                max_abs = diff.max().item()
+                # BF16 spacing at each reference magnitude. Near cancellation,
+                # allow a small FP32 accumulation error relative to sample peak.
+                exponent = torch.frexp(a.abs())[1].to(torch.float64)
+                ulp = torch.pow(2.0, exponent - 8).clamp_min(2.0 ** -133)
+                ulp = torch.where(a == 0, torch.full_like(ulp, 2.0 ** -133), ulp)
+                local_ok = bool((diff <= ulp + peak * 2e-6).all())
+                passed = rel <= 1e-5 and max_abs <= peak * 1e-4 and local_ok
+                logging.info("[H3 ConvRot] sample passed=%s relative_l2=%.9g max_abs=%.9g mismatch=%s/%s local_ok=%s",
+                             passed, rel, max_abs, (a != b).sum().item(), a.numel(), local_ok)
+                if not passed:
+                    raise RuntimeError("ConvRot BF16 tolerance sample mismatch")
                 self.checked.add(key)
-                logging.info("[H3 ConvRot] exact sample passed shape=%s", key)
             out = self._compute(q, scale)
             self.hits += 1
             return out
