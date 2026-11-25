@@ -224,6 +224,26 @@ class H3MPSQuantAccelerator:
 
         def wrapper(apply_model, params):
             with lock:
+                if convrot is not None:
+                    # No public int8_linear monkeypatch or general operator tracing
+                    # in Metal mode. Only intercept the exact ConvRot custom op.
+                    class ConvRotOnly(TorchDispatchMode):
+                        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                            if str(func) == "comfy_kitchen.dequantize_int8_convrot_weight_dtype.default":
+                                return convrot.call(func, args, kwargs or {})
+                            return func(*args, **(kwargs or {}))
+
+                    hits, fallbacks = convrot.hits, convrot.fallbacks
+                    try:
+                        with ConvRotOnly():
+                            if previous is not None:
+                                return previous(apply_model, params)
+                            return apply_model(params["input"], params["timestep"], **params["c"])
+                    finally:
+                        logging.info("[H3 ConvRot] step hits=%s fallback=%s cumulative_hits=%s disabled=%s",
+                                     convrot.hits - hits, convrot.fallbacks - fallbacks,
+                                     convrot.hits, convrot.disabled)
+
                 original = getattr(ck, "int8_linear", None)
                 def run():
                     if previous is not None:
