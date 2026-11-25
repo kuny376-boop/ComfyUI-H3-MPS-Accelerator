@@ -128,13 +128,77 @@ class H3MPSProfilerReport:
         return signal, report
 
 
+
+class H3MPSMemoryManager:
+    """Opt-in conditioning barrier; never changes model precision."""
+    CATEGORY = "H3 MPS Accelerator"
+    FUNCTION = "apply"
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "conditioning": ("CONDITIONING",),
+            "offload_text_encoder": ("BOOLEAN", {"default": True}),
+        }}
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def apply(self, conditioning, offload_text_encoder):
+        if mm.get_torch_device().type != "mps":
+            return (conditioning,)
+        import gc
+        import logging
+        import psutil
+
+        def snapshot():
+            return {
+                "allocated_MiB": round(torch.mps.current_allocated_memory() / 2**20),
+                "driver_MiB": round(torch.mps.driver_allocated_memory() / 2**20),
+                "available_MiB": round(psutil.virtual_memory().available / 2**20),
+                "swap_MiB": round(psutil.swap_memory().used / 2**20),
+            }
+
+        torch.mps.synchronize()
+        logging.info("[H3 MPS Memory] before: %s", snapshot())
+        if offload_text_encoder:
+            entries = getattr(mm, "current_loaded_models", None)
+            if isinstance(entries, list):
+                for entry in list(entries):
+                    patcher = getattr(entry, "model", None)
+                    model = getattr(patcher, "model", None)
+                    if type(model).__name__ != "MiniMaxH3TEModel_":
+                        continue
+                    if getattr(entry.device, "type", None) != "mps":
+                        continue
+                    if not callable(getattr(entry, "model_unload", None)):
+                        continue
+                    if getattr(entry, "model_finalizer", None) is None:
+                        continue
+                    if entry.model_unload():
+                        entries.remove(entry)
+                        logging.info("[H3 MPS Memory] offloaded H3 text encoder")
+            else:
+                logging.warning("[H3 MPS Memory] unsupported model registry; skip offload")
+        gc.collect()
+        torch.mps.empty_cache()
+        torch.mps.synchronize()
+        logging.info("[H3 MPS Memory] after: %s", snapshot())
+        return (conditioning,)
+
+
 NODE_CLASS_MAPPINGS = {
+    "H3MPSMemoryManager": H3MPSMemoryManager,
     "H3MPSRuntimeGuard": H3MPSRuntimeGuard,
     "H3MPSAttentionProfiler": H3MPSAttentionProfiler,
     "H3MPSProfilerReport": H3MPSProfilerReport,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "H3MPSMemoryManager": "H3 MPS Memory Manager",
     "H3MPSRuntimeGuard": "H3 MPS Runtime Guard",
     "H3MPSAttentionProfiler": "H3 MPS Attention Profiler",
     "H3MPSProfilerReport": "H3 MPS Profiler Report",
