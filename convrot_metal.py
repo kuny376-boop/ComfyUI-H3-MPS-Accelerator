@@ -31,7 +31,8 @@ kernel void convrot256_rows(const device char* q [[buffer(0)]],
                        device bfloat* out [[buffer(2)]],
                        uint2 pos [[thread_position_in_grid]],
                        uint2 dims [[threads_per_grid]],
-                       uint t [[thread_position_in_threadgroup]]) {
+                       uint2 local [[thread_position_in_threadgroup]]) {
+    uint t = local.x;
     uint i = pos.y * dims.x + pos.x;
     threadgroup float a[256];
     // Integer butterfly is exact for 256 signed INT8 values.
