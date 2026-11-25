@@ -30,7 +30,17 @@ def main():
     p.add_argument("--out-features", type=int, default=6144)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--per-row", action="store_true")
+    p.add_argument("--h3-suite", action="store_true", help="Run all four observed H3 weight shapes in isolated processes")
     a = p.parse_args()
+    if a.h3_suite:
+        import subprocess
+        import sys
+        for out_f, in_f in [(21504, 5376), (5376, 7168), (28672, 5376), (5376, 14336)]:
+            print(f"\nH3 weight {out_f} x {in_f}", flush=True)
+            subprocess.run([sys.executable, __file__, "--tokens", str(a.tokens),
+                            "--in-features", str(in_f), "--out-features", str(out_f),
+                            "--per-row", "--repeats", str(a.repeats)], check=True)
+        return
     if not torch.backends.mps.is_available():
         raise RuntimeError("MPS required")
     if min(a.tokens, a.in_features, a.out_features, a.repeats) <= 0 or a.in_features % 256:
