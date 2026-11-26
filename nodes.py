@@ -202,7 +202,7 @@ class H3MPSQuantAccelerator:
     def INPUT_TYPES(cls):
         return {"required": {
             "model": ("MODEL",),
-            "backend": (["observe", "chunked", "convrot_metal", "convrot_direct", "native", "int8_packed"], {"default": "observe"}),
+            "backend": (["observe", "chunked", "convrot_metal", "convrot_direct", "native", "int8_packed", "native_int8_status"], {"default": "observe"}),
             "chunk_mib": ("INT", {"default": 128, "min": 64, "max": 512, "step": 64}),
         }}
 
@@ -224,6 +224,10 @@ class H3MPSQuantAccelerator:
 
         if backend == "native":
             return (model,)
+        if backend == "native_int8_status":
+            from .int8_backend import runtime_status
+            logging.info("[H3 Native INT8] %s", runtime_status())
+            return (model,)
 
         from .packed_linear import PackedLinear, packed_scope
         packed = PackedLinear() if backend == "int8_packed" else None
@@ -240,6 +244,7 @@ class H3MPSQuantAccelerator:
                     finally:
                         logging.info("[H3 Packed] step hits=%s fallback=%s cumulative_hits=%s",
                                      packed.hits-hits, packed.fallbacks-misses, packed.hits)
+                        logging.info("[H3 Packed] cumulative reasons=%s", dict(packed.reasons))
                 if convrot is not None:
                     # No public int8_linear monkeypatch or general operator tracing
                     # in Metal mode. Only intercept the exact ConvRot custom op.
