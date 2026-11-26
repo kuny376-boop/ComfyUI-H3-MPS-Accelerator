@@ -18,6 +18,9 @@ class PackedLinear:
         self.disabled = False
         self.reasons = Counter()
         self.hadamard = {}
+        self.reuse_activation = os.environ.get('H3_PACKED_REUSE_ACTIVATION', '0') == '1'
+        self.activation_entry = None
+        self.activation_limit = 64 * 1024 * 1024
         self.sample_validation = os.environ.get('H3_PACKED_SAMPLE_VALIDATION', '0') == '1'
 
     def compute(self, x, q, scale, bias):
@@ -27,7 +30,7 @@ class PackedLinear:
         if h is None:
             h = _build_hadamard(256, device=x.device, dtype=torch.float32)
             self.hadamard[key] = h
-        xr = _rotate_activation(x.reshape(-1, x.shape[-1]).float(), h, 256).to(x.dtype).contiguous()
+        xr = self.rotate(x, h, _rotate_activation)
         s = scale.to(dtype=x.dtype).reshape(-1)
         if s.numel() == 1:
             s = s.expand(q.shape[0])
@@ -35,6 +38,27 @@ class PackedLinear:
         if bias is not None:
             y = y + bias
         return y.reshape(*x.shape[:-1], q.shape[0])
+
+    def rotate(self, x, h, rotate):
+        # Single-entry cache, scoped to one model invocation. Never reuse
+        # unversioned inference tensors or tensors with unknown mutation state.
+        key = None
+        if self.reuse_activation and x.numel() * x.element_size() <= self.activation_limit:
+            try:
+                key = (id(x), x._version, tuple(x.shape), tuple(x.stride()),
+                       x.storage_offset(), x.dtype, x.device)
+            except (RuntimeError, AttributeError):
+                self.reasons["activation_unversioned"] += 1
+        entry = self.activation_entry
+        if key is not None and entry is not None and entry[0] == key and entry[1]() is x:
+            self.reasons["activation_cache_hits"] += 1
+            return entry[2]
+        self.activation_entry = None
+        xr = rotate(x.reshape(-1, x.shape[-1]).float(), h, 256).to(x.dtype).contiguous()
+        if key is not None:
+            self.activation_entry = (key, weakref.ref(x), xr)
+            self.reasons["activation_cache_misses"] += 1
+        return xr
 
     def run(self, module, original, x, args, kwargs):
         # Accept the native forward's explicit default cast arguments.
@@ -187,6 +211,7 @@ class PackedLinear:
 def packed_scope(root, engine):
     owner = threading.get_ident()
     patches = []
+    engine.activation_entry = None
     try:
         for module in root.modules():
             if (not hasattr(module, "forward_comfy_cast_weights")
@@ -211,6 +236,7 @@ def packed_scope(root, engine):
             patches.append((module, had, prior, replacement))
         yield
     finally:
+        engine.activation_entry = None
         for module, had, prior, replacement in reversed(patches):
             if module.__dict__.get("forward_comfy_cast_weights") is replacement:
                 if had:
