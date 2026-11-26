@@ -1,6 +1,7 @@
 """Opt-in weight-only INT8 path for resident H3 mixed precision Linear modules."""
 from contextlib import contextmanager
 import functools
+import inspect
 import logging
 import threading
 from collections import Counter
@@ -33,6 +34,12 @@ class PackedLinear:
         return y.reshape(*x.shape[:-1], q.shape[0])
 
     def run(self, module, original, x, args, kwargs):
+        # Keep the original forward (including run_every_op) intact.
+        # Only use the resident path when no cast/offload is requested.
+        if getattr(module, "comfy_cast_weights", False) or getattr(module, "_prefetch", None) is not None or getattr(module, "_v", None) is not None:
+            self.fallbacks += 1
+            self.reasons["managed_weight"] += 1
+            return original(x, *args, **kwargs)
         from comfy_kitchen.tensor.int8 import QuantizedTensor
         w = getattr(module, "weight", None)
         p = getattr(w, "_params", None)
@@ -96,9 +103,13 @@ def packed_scope(root, engine):
             if (not hasattr(module, "forward_comfy_cast_weights")
                     or getattr(module, "quant_format", None) != "int8_tensorwise"):
                 continue
-            original = module.forward
-            prior = module.__dict__.get("forward")
-            had = "forward" in module.__dict__
+            original = module.forward_comfy_cast_weights
+            try:
+                inspect.signature(original).bind(object())
+            except (TypeError, ValueError):
+                continue
+            prior = module.__dict__.get("forward_comfy_cast_weights")
+            had = "forward_comfy_cast_weights" in module.__dict__
             def make(m, fn):
                 @functools.wraps(fn)
                 def forward(x, *args, **kwargs):
@@ -107,13 +118,13 @@ def packed_scope(root, engine):
                     return engine.run(m, fn, x, args, kwargs)
                 return forward
             replacement = make(module, original)
-            module.forward = replacement
+            module.forward_comfy_cast_weights = replacement
             patches.append((module, had, prior, replacement))
         yield
     finally:
         for module, had, prior, replacement in reversed(patches):
-            if module.__dict__.get("forward") is replacement:
+            if module.__dict__.get("forward_comfy_cast_weights") is replacement:
                 if had:
-                    module.forward = prior
+                    module.forward_comfy_cast_weights = prior
                 else:
-                    del module.forward
+                    del module.forward_comfy_cast_weights
