@@ -18,7 +18,9 @@ def main():
     p.add_argument("--protected-blocks", type=int, default=5)
     p.add_argument("--block", type=int, default=64)
     p.add_argument("--output", type=Path, default=Path("spark_capture_report.json"))
+    p.add_argument("--anchors", type=int, nargs="+", default=[0,1])
     a = p.parse_args()
+    if any(i<0 or i>32 for i in a.anchors): p.error("anchors must be 0..32")
     if a.repeats < 1 or a.block < 1 or a.protected_blocks < 0:
         p.error("invalid repeats or block settings")
     files = sorted(a.directory.glob("*.safetensors"))
@@ -56,16 +58,17 @@ def main():
                 "dtype":str(q.dtype),"dense_seconds":seconds,"results":[]}
         print(f"\n{path.name} block={meta.get('block')} shape={tuple(q.shape)} dense={seconds:.6f}s",flush=True)
         for density in (1.0,0.5,0.3,0.2,0.1):
-            for weighted in (False,True):
+            for anchor_count in a.anchors:
+                weighted = anchor_count > 0
                 y,t=measure(lambda:sparse_reference(q,k,v,density=density,block=a.block,
-                                                    weighted=weighted,protected=protected))
+                                                    weighted=weighted,protected=protected,anchors=max(1,anchor_count)))
                 yf=y.float()
                 finite=bool(torch.isfinite(yf).all().item())
                 rel=((yf-rf).norm()/rf.norm().clamp_min(1e-12)).item()
                 cos=F.cosine_similarity(yf.flatten(),rf.flatten(),dim=0).item()
                 nb=math.ceil(n/a.block)
                 row={"density":density,"effective_block_fraction":max(math.ceil(nb*density),math.ceil(protected/a.block))/nb,
-                     "weighted":weighted,"seconds":t,"relative_l2":rel if math.isfinite(rel) else None,
+                     "weighted":weighted,"anchors":anchor_count,"seconds":t,"relative_l2":rel if math.isfinite(rel) else None,
                      "cosine":cos if math.isfinite(cos) else None,"finite":finite}
                 sample["results"].append(row)
                 print(json.dumps(row),flush=True)
