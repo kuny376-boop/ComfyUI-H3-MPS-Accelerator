@@ -371,7 +371,38 @@ class H3MPSQuantAccelerator:
 import threading as _threading
 _H3_QUANT_LOCK = _threading.RLock()
 
+class H3MPSAttentionCapture:
+    CATEGORY = "H3 MPS Accelerator"
+    FUNCTION = "apply"
+    RETURN_TYPES = ("MODEL",)
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "enabled": ("BOOLEAN", {"default": False}),
+            "heads": ("INT", {"default": 2, "min": 1, "max": 8}),
+            "max_samples": ("INT", {"default": 5, "min": 1, "max": 5}),
+        }}
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+    def apply(self, model, enabled, heads, max_samples):
+        if not enabled or not _is_h3(model):
+            return (model,)
+        import folder_paths
+        from pathlib import Path
+        from .attention_capture import make_capture_override
+        patched = model.clone()
+        options = patched.model_options.setdefault("transformer_options", {})
+        options["optimized_attention_override"] = make_capture_override(
+            options.get("optimized_attention_override"),
+            Path(folder_paths.get_output_directory()) / "h3_attention_capture",
+            heads, max_samples)
+        return (patched,)
+
+
 NODE_CLASS_MAPPINGS = {
+    "H3MPSAttentionCapture": H3MPSAttentionCapture,
     "H3MPSQuantAccelerator": H3MPSQuantAccelerator,
     "H3MPSMemoryManager": H3MPSMemoryManager,
     "H3MPSRuntimeGuard": H3MPSRuntimeGuard,
@@ -380,6 +411,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "H3MPSAttentionCapture": "H3 MPS Attention Capture",
     "H3MPSQuantAccelerator": "H3 MPS Quant Accelerator",
     "H3MPSMemoryManager": "H3 MPS Memory Manager",
     "H3MPSRuntimeGuard": "H3 MPS Runtime Guard",
