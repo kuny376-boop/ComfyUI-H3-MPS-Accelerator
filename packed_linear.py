@@ -10,6 +10,30 @@ from collections import Counter
 import torch
 import torch.nn.functional as F
 
+# Same regular H256 butterfly as our existing ConvRot weight shader.
+_ACTIVATION_SHADER = r"""
+#include <metal_stdlib>
+using namespace metal;
+kernel void rotate_h256(device const bfloat* input [[buffer(0)]],
+                        device bfloat* output [[buffer(1)]],
+                        uint i [[thread_position_in_grid]],
+                        uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float a[256];
+    a[t] = float(input[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1; stride < 256; stride *= 4) {
+        uint digit = (t / stride) % 4;
+        uint base = t - digit * stride;
+        float v = a[base] + a[base+stride] + a[base+2*stride] + a[base+3*stride]
+                  - 2.0f * a[base+(3-digit)*stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        a[t] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    output[i] = bfloat(a[t] * 0.0625f);
+}
+"""
+
 class PackedLinear:
     def __init__(self):
         self.checked = {}
@@ -20,6 +44,10 @@ class PackedLinear:
         self.hadamard = {}
         self.reuse_activation = os.environ.get('H3_PACKED_REUSE_ACTIVATION', '0') == '1'
         self.activation_entry = None
+        self.metal_activation = os.environ.get('H3_PACKED_METAL_ACTIVATION', '0') == '1'
+        self.activation_shader = None
+        self.activation_checked = False
+        self.activation_disabled = False
         self.activation_limit = 64 * 1024 * 1024
         self.sample_validation = os.environ.get('H3_PACKED_SAMPLE_VALIDATION', '0') == '1'
 
@@ -54,11 +82,50 @@ class PackedLinear:
             self.reasons["activation_cache_hits"] += 1
             return entry[2]
         self.activation_entry = None
-        xr = rotate(x.reshape(-1, x.shape[-1]).float(), h, 256).to(x.dtype).contiguous()
+        xr = self.rotate_uncached(x, h, rotate)
         if key is not None:
             self.activation_entry = (key, weakref.ref(x), xr)
             self.reasons["activation_cache_misses"] += 1
         return xr
+
+    def rotate_uncached(self, x, h, rotate):
+        def reference(v):
+            return rotate(v.reshape(-1, v.shape[-1]).float(), h, 256).to(v.dtype).contiguous()
+
+        if (not self.metal_activation or self.activation_disabled
+                or x.device.type != "mps" or x.dtype != torch.bfloat16
+                or not x.is_contiguous() or x.storage_offset() != 0
+                or x.ndim < 2 or x.shape[-1] % 256
+                or not 0 < x.numel() < 2**31):
+            return reference(x)
+        try:
+            if self.activation_shader is None:
+                self.activation_shader = torch.mps.compile_shader(_ACTIVATION_SHADER)
+            def launch(v):
+                out = torch.empty_like(v)
+                self.activation_shader.rotate_h256(v, out, threads=(v.numel(),), group_size=(256,))
+                return out.reshape(-1, v.shape[-1])
+            if not self.activation_checked:
+                # Compare the actual activation and a deterministic basis probe
+                # against the installed comfy-kitchen rotation convention.
+                probe = torch.eye(256, device=x.device, dtype=x.dtype)
+                sample = x.reshape(-1, x.shape[-1])[:16].clone()
+                for v in (probe, sample):
+                    a = reference(v).float()
+                    b = launch(v).float()
+                    rel = ((a-b).norm() / a.norm().clamp_min(1e-12)).item()
+                    if not bool(torch.isfinite(b).all().item()) or rel > 0.002:
+                        raise RuntimeError("activation rotation validation failed: %g" % rel)
+                self.activation_checked = True
+            out = launch(x)
+            self.reasons["metal_activation_hits"] += 1
+            return out
+        except (RuntimeError, TypeError, ValueError, AttributeError, NotImplementedError) as exc:
+            self.activation_disabled = True
+            self.activation_entry = None
+            self.reasons["metal_activation_fallback"] += 1
+            logging.warning("[H3 Packed] Metal activation disabled: %r", exc)
+            return reference(x)
 
     def run(self, module, original, x, args, kwargs):
         # Accept the native forward's explicit default cast arguments.
