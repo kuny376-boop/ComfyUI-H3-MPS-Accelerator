@@ -1,4 +1,4 @@
-"""Opt-in weight-only INT8 path for resident H3 mixed precision Linear modules."""
+"""Experimental weight-only INT8 path for prepared H3 mixed precision Linear modules."""
 from contextlib import contextmanager
 import functools
 import inspect
@@ -65,6 +65,10 @@ class PackedLinear:
             self.fallbacks += 1
             self.reasons["module_guard"] += 1
             return original(x, *args, **kwargs)
+        if self.disabled or not hasattr(torch, "_weight_int8pack_mm"):
+            self.fallbacks += 1
+            self.reasons["native_unavailable"] += 1
+            return original(x, *args, **kwargs)
         context = getattr(ops, "CastBiasWeightContext", None)
         if context is None:
             self.reasons["missing_context"] += 1
@@ -74,7 +78,7 @@ class PackedLinear:
             inspect.signature(ops.cast_bias_weight).bind(module, input=None,
                 dtype=w.dtype, device=x.device, bias_dtype=x.dtype,
                 offloadable=True, compute_dtype=x.dtype, want_requant=True)
-        except (TypeError, ValueError):
+        except (AttributeError, TypeError, ValueError):
             self.reasons["context_signature"] += 1
             self.fallbacks += 1
             return original(x, *args, **kwargs)
@@ -117,6 +121,7 @@ class PackedLinear:
             self.fallbacks += 1
             self.reasons['ineligible'] += 1
             return None
+        # Cache only for this model invocation; prepared buffers may be reused.
         key = (id(module), id(w), q.data_ptr(), s.data_ptr())
         try:
             if key not in self.checked:
@@ -142,6 +147,7 @@ class PackedLinear:
 @contextmanager
 def packed_scope(root, engine):
     owner = threading.get_ident()
+    engine.checked.clear()
     patches = []
     try:
         for module in root.modules():
