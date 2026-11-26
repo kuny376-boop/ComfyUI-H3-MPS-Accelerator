@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import functools
 import logging
 import threading
+from collections import Counter
 import torch
 import torch.nn.functional as F
 
@@ -12,10 +13,16 @@ class PackedLinear:
         self.hits = 0
         self.fallbacks = 0
         self.disabled = False
+        self.reasons = Counter()
+        self.hadamard = {}
 
     def compute(self, x, q, scale, bias):
         from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
-        h = _build_hadamard(256, device=x.device, dtype=torch.float32)
+        key = (x.device, torch.float32, 256)
+        h = self.hadamard.get(key)
+        if h is None:
+            h = _build_hadamard(256, device=x.device, dtype=torch.float32)
+            self.hadamard[key] = h
         xr = _rotate_activation(x.reshape(-1, x.shape[-1]).float(), h, 256).to(x.dtype).contiguous()
         s = scale.to(dtype=x.dtype).reshape(-1)
         if s.numel() == 1:
@@ -52,10 +59,11 @@ class PackedLinear:
                 or q.device != x.device or q.dtype != torch.int8 or not q.is_contiguous()
                 or q.shape[1] != x.shape[-1] or q.shape[1] % 256 or q.shape[0] % 32
                 or not isinstance(s, torch.Tensor) or s.device != x.device
-                or tuple(s.shape) not in ((), (1,), (1,1), (q.shape[0],1))
+                or tuple(s.shape) not in ((), (1,), (1,1), (q.shape[0],), (q.shape[0],1))
                 or (b is not None and (b.device != x.device or b.dtype != x.dtype))
                 or args or kwargs):
             self.fallbacks += 1
+            self.reasons['ineligible'] += 1
             return original(x, *args, **kwargs)
         key = (id(module), id(w), q.data_ptr(), s.data_ptr())
         try:
@@ -73,8 +81,10 @@ class PackedLinear:
                 return y
         except (RuntimeError, ValueError, TypeError, NotImplementedError) as exc:
             self.checked[key] = False
+            self.reasons['native_exception'] += 1
             logging.warning("[H3 Packed] native fallback: %r", exc)
         self.fallbacks += 1
+        self.reasons['validation_or_native_failure'] += 1
         return original(x, *args, **kwargs)
 
 @contextmanager
