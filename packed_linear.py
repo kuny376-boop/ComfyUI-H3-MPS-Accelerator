@@ -50,6 +50,8 @@ class PackedLinear:
         self.activation_disabled = False
         self.w8a8 = os.environ.get('H3_PACKED_W8A8', '0') == '1'
         self.w8a8_disabled = False
+        self.w8a8_metal = os.environ.get('H3_PACKED_W8A8_METAL', '0') == '1'
+        self.w8a8_engine = None
         self.activation_limit = 64 * 1024 * 1024
         self.sample_validation = os.environ.get('H3_PACKED_SAMPLE_VALIDATION', '0') == '1'
 
@@ -74,11 +76,11 @@ class PackedLinear:
     def try_w8a8(self, xr, q, s):
         # Experimental native operator probe, not a custom Metal GEMM.
         # Never transfer to CPU or expand the full weight.
-        if not self.w8a8 or self.w8a8_disabled:
+        if not (self.w8a8 or self.w8a8_metal) or self.w8a8_disabled:
             return None
         if (xr.device.type != "mps" or xr.ndim != 2 or xr.shape[0] == 0
                 or xr.shape[1] > 131072 or xr.shape[0] % 8
-                or q.shape[0] % 32 or not hasattr(torch, "_int_mm")):
+                or q.shape[0] % 32 or (not self.w8a8_metal and not hasattr(torch, "_int_mm"))):
             self.reasons["w8a8_ineligible"] += 1
             return None
         def calculate(v):
@@ -87,6 +89,11 @@ class PackedLinear:
             scale = amax / 127.0
             safe = torch.where(scale > 0, scale, torch.ones_like(scale))
             a = (f / safe).round().clamp(-127, 127).to(torch.int8).contiguous()
+            if self.w8a8_metal:
+                if self.w8a8_engine is None:
+                    from .w8a8_metal import MetalW8A8
+                    self.w8a8_engine = MetalW8A8()
+                return self.w8a8_engine.compute(a, q, scale, s)
             acc = torch._int_mm(a, q.t())
             if acc.device != v.device or acc.dtype != torch.int32:
                 raise RuntimeError("unexpected INT8 accumulator")
@@ -102,7 +109,7 @@ class PackedLinear:
                 self.reasons["w8a8_rejected"] += 1
                 return None
             y = calculate(xr)
-            self.reasons["w8a8_hits"] += 1
+            self.reasons["w8a8_metal_hits" if self.w8a8_metal else "w8a8_hits"] += 1
             return y
         except (RuntimeError, TypeError, ValueError, AttributeError, NotImplementedError) as exc:
             self.w8a8_disabled = True
