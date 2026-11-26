@@ -48,6 +48,8 @@ class PackedLinear:
         self.activation_shader = None
         self.activation_checked = False
         self.activation_disabled = False
+        self.w8a8 = os.environ.get('H3_PACKED_W8A8', '0') == '1'
+        self.w8a8_disabled = False
         self.activation_limit = 64 * 1024 * 1024
         self.sample_validation = os.environ.get('H3_PACKED_SAMPLE_VALIDATION', '0') == '1'
 
@@ -62,10 +64,51 @@ class PackedLinear:
         s = scale.to(dtype=x.dtype).reshape(-1)
         if s.numel() == 1:
             s = s.expand(q.shape[0])
-        y = torch._weight_int8pack_mm(xr, q, s.contiguous())
+        y = self.try_w8a8(xr, q, s.contiguous())
+        if y is None:
+            y = torch._weight_int8pack_mm(xr, q, s.contiguous())
         if bias is not None:
             y = y + bias
         return y.reshape(*x.shape[:-1], q.shape[0])
+
+    def try_w8a8(self, xr, q, s):
+        # Experimental native operator probe, not a custom Metal GEMM.
+        # Never transfer to CPU or expand the full weight.
+        if not self.w8a8 or self.w8a8_disabled:
+            return None
+        if (xr.device.type != "mps" or xr.ndim != 2 or xr.shape[0] == 0
+                or xr.shape[1] > 131072 or xr.shape[0] % 8
+                or q.shape[0] % 32 or not hasattr(torch, "_int_mm")):
+            self.reasons["w8a8_ineligible"] += 1
+            return None
+        def calculate(v):
+            f = v.float()
+            amax = f.abs().amax(dim=1, keepdim=True)
+            scale = amax / 127.0
+            safe = torch.where(scale > 0, scale, torch.ones_like(scale))
+            a = (f / safe).round().clamp(-127, 127).to(torch.int8).contiguous()
+            acc = torch._int_mm(a, q.t())
+            if acc.device != v.device or acc.dtype != torch.int32:
+                raise RuntimeError("unexpected INT8 accumulator")
+            return (acc.float() * scale * s.float().reshape(1, -1)).to(v.dtype)
+        try:
+            # Validate each call's first rows: activation quantization error is
+            # data dependent. No acceptance cache across weights or inputs.
+            sample = xr[:min(16, xr.shape[0])].contiguous()
+            ref = torch._weight_int8pack_mm(sample, q, s).float()
+            got = calculate(sample).float()
+            rel = ((got-ref).norm() / ref.norm().clamp_min(1e-12)).item()
+            if not bool(torch.isfinite(got).all().item()) or not rel <= 0.005:
+                self.reasons["w8a8_rejected"] += 1
+                return None
+            y = calculate(xr)
+            self.reasons["w8a8_hits"] += 1
+            return y
+        except (RuntimeError, TypeError, ValueError, AttributeError, NotImplementedError) as exc:
+            self.w8a8_disabled = True
+            self.reasons["w8a8_native_fallback"] += 1
+            logging.warning("[H3 Packed] native W8A8 unavailable: %r", exc)
+            return None
 
     def rotate(self, x, h, rotate):
         # Single-entry cache, scoped to one model invocation. Never reuse
