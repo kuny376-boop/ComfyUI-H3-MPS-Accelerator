@@ -4,6 +4,7 @@ import functools
 import inspect
 import logging
 import threading
+import weakref
 from collections import Counter
 import torch
 import torch.nn.functional as F
@@ -121,23 +122,42 @@ class PackedLinear:
             self.fallbacks += 1
             self.reasons['ineligible'] += 1
             return None
-        # Cache only for this model invocation; prepared buffers may be reused.
-        key = (id(module), id(w), q.data_ptr(), s.data_ptr())
+        # Reuse validation only for unchanged, live source buffers. Never trust
+        # a recycled prepared-buffer address or an untracked inference tensor.
+        source = getattr(module, 'weight', None)
+        sq = getattr(source, '_qdata', None)
+        ss = getattr(getattr(source, '_params', None), 'scale', None)
+        key = None
         try:
-            if key not in self.checked:
+            if sq is q and ss is s and b is None:
+                key = (id(module), id(q), id(s), q._version, s._version,
+                       tuple(q.shape), tuple(s.shape), x.dtype, x.device)
+        except (RuntimeError, AttributeError):
+            pass
+        entry = self.checked.get(id(module)) if key is not None else None
+        cached = (entry is not None and entry[0] == key
+                  and entry[1]() is q and entry[2]() is s)
+        ok = entry[3] if cached else False
+        try:
+            if not cached:
                 sample = x.reshape(-1, x.shape[-1])[:16].contiguous()
                 ref = F.linear(sample, w.dequantize().to(sample.dtype), b).float()
                 got = self.compute(sample, q, s, b).float()
                 rel = ((got-ref).norm() / ref.norm().clamp_min(1e-12)).item()
                 ok = bool(torch.isfinite(got).all().item()) and rel <= 0.005
-                self.checked[key] = ok
-                logging.info("[H3 Packed] shape=%s rel=%.6g passed=%s", tuple(q.shape), rel, ok)
-            if self.checked[key]:
+                if key is not None:
+                    self.checked[id(module)] = (key, weakref.ref(q), weakref.ref(s), ok)
+                self.reasons['validation_checks'] += 1
+                if not ok:
+                    logging.warning("[H3 Packed] validation rejected shape=%s rel=%.6g", tuple(q.shape), rel)
+            else:
+                self.reasons['validation_cache_hits'] += 1
+            if ok:
                 y = self.compute(x, q, s, b)
                 self.hits += 1
                 return y
         except (RuntimeError, ValueError, TypeError, NotImplementedError) as exc:
-            self.checked[key] = False
+            self.checked.pop(id(module), None)
             self.reasons['native_exception'] += 1
             logging.warning("[H3 Packed] native fallback: %r", exc)
         self.fallbacks += 1
@@ -147,7 +167,6 @@ class PackedLinear:
 @contextmanager
 def packed_scope(root, engine):
     owner = threading.get_ident()
-    engine.checked.clear()
     patches = []
     try:
         for module in root.modules():
