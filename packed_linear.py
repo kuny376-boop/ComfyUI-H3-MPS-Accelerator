@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import functools
 import inspect
 import logging
+import os
 import threading
 import weakref
 from collections import Counter
@@ -17,6 +18,7 @@ class PackedLinear:
         self.disabled = False
         self.reasons = Counter()
         self.hadamard = {}
+        self.sample_validation = os.environ.get('H3_PACKED_SAMPLE_VALIDATION', '0') == '1'
 
     def compute(self, x, q, scale, bias):
         from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
@@ -141,8 +143,25 @@ class PackedLinear:
         try:
             if not cached:
                 sample = x.reshape(-1, x.shape[-1])[:16].contiguous()
-                ref = F.linear(sample, w.dequantize().to(sample.dtype), b).float()
-                got = self.compute(sample, q, s, b).float()
+                if self.sample_validation:
+                    # Three disjoint 128-channel bands, preserving native alignment.
+                    from comfy_kitchen.backends.eager.quantization import dequantize_int8_convrot_weight
+                    n = q.shape[0]
+                    width = min(128, n)
+                    starts = sorted({0, ((n-width)//64)*32, n-width})
+                    idx = torch.cat([torch.arange(a, a+width, device=q.device) for a in starts]).unique(sorted=True)
+                    qs = q.index_select(0, idx).contiguous()
+                    ssample = s.reshape(-1)
+                    if ssample.numel() != 1:
+                        ssample = ssample.index_select(0, idx).reshape(-1, 1)
+                    bs = b.index_select(0, idx) if b is not None else None
+                    ref = F.linear(sample, dequantize_int8_convrot_weight(qs, ssample, 256).to(sample.dtype), bs).float()
+                    # Check the actual full-width native kernel, not a different small GEMM.
+                    got = self.compute(sample, q, s, b).index_select(-1, idx).float()
+                    self.reasons['sampled_validation'] += 1
+                else:
+                    ref = F.linear(sample, w.dequantize().to(sample.dtype), b).float()
+                    got = self.compute(sample, q, s, b).float()
                 rel = ((got-ref).norm() / ref.norm().clamp_min(1e-12)).item()
                 ok = bool(torch.isfinite(got).all().item()) and rel <= 0.005
                 if key is not None:
