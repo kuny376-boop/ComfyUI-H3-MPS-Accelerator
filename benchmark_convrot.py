@@ -23,6 +23,22 @@ def rotated_linear(x, q, scale, bias=None, group=256):
     return F.linear(xr, w, bias)
 
 
+def packed_linear(x, q, scale, group=256):
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
+    if q.ndim != 2 or q.dtype != torch.int8 or any(d % 32 for d in q.shape):
+        raise ValueError("unsupported packed weight")
+    if x.shape[-1] != q.shape[1] or q.shape[1] % group:
+        raise ValueError("unsupported input/group")
+    h = _build_hadamard(group, device=x.device, dtype=torch.float32)
+    xr = _rotate_activation(x.float(), h, group).to(x.dtype).contiguous()
+    scales = scale.to(dtype=x.dtype).reshape(-1)
+    if scales.numel() == 1:
+        scales = scales.expand(q.shape[0])
+    if scales.numel() != q.shape[0]:
+        raise ValueError("unsupported scale")
+    return torch._weight_int8pack_mm(xr, q.contiguous(), scales.contiguous())
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--tokens", type=int, default=512)
@@ -80,6 +96,20 @@ def main():
             return F.linear(x, metal.call(op, (q, scale, 256, 2), {}))
         print("metal seconds", measure(fused), "hits", metal.hits,
               "fallbacks", metal.fallbacks, "disabled", metal.disabled)
+        torch.mps.empty_cache()
+        def packed():
+            return packed_linear(x, q, scale)
+        try:
+            ref, got = native(), packed()
+            diff = got.float() - ref.float()
+            print("packed finite", torch.isfinite(got).all().item(),
+                  "max_abs", diff.abs().max().item(),
+                  "relative_l2", (diff.norm() / ref.float().norm().clamp_min(1e-12)).item())
+            del ref, got, diff
+            torch.mps.empty_cache()
+            print("packed seconds", measure(packed))
+        except (RuntimeError, ValueError, NotImplementedError) as exc:
+            print("packed FAILED", repr(exc))
 
 
 if __name__ == "__main__":
