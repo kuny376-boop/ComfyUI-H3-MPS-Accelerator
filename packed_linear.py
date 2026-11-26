@@ -34,8 +34,19 @@ class PackedLinear:
         return y.reshape(*x.shape[:-1], q.shape[0])
 
     def run(self, module, original, x, args, kwargs):
-        # Keep the original forward (including run_every_op) intact.
-        # Only use the resident path when no cast/offload is requested.
+        # Accept the native forward's explicit default cast arguments.
+        try:
+            bound = inspect.signature(original).bind(x, *args, **kwargs)
+            bound.apply_defaults()
+        except (TypeError, ValueError):
+            return original(x, *args, **kwargs)
+        options = dict(bound.arguments)
+        options.pop(next(iter(options)), None)
+        if any(k not in ("compute_dtype", "want_requant", "weight_only_quant")
+               for k in options) or options.get("want_requant") or options.get("weight_only_quant") or options.get("compute_dtype") not in (None, x.dtype):
+            self.fallbacks += 1
+            self.reasons["cast_options"] += 1
+            return original(x, *args, **kwargs)
         if getattr(module, "comfy_cast_weights", False) or getattr(module, "_prefetch", None) is not None or getattr(module, "_v", None) is not None:
             self.fallbacks += 1
             self.reasons["managed_weight"] += 1
@@ -68,7 +79,7 @@ class PackedLinear:
                 or not isinstance(s, torch.Tensor) or s.device != x.device
                 or tuple(s.shape) not in ((), (1,), (1,1), (q.shape[0],), (q.shape[0],1))
                 or (b is not None and (b.device != x.device or b.dtype != x.dtype))
-                or args or kwargs):
+                ):
             self.fallbacks += 1
             self.reasons['ineligible'] += 1
             return original(x, *args, **kwargs)
@@ -76,7 +87,7 @@ class PackedLinear:
         try:
             if key not in self.checked:
                 sample = x.reshape(-1, x.shape[-1])[:16].contiguous()
-                ref = original(sample).float()
+                ref = original(sample, *args, **kwargs).float()
                 got = self.compute(sample, q, s, b).float()
                 rel = ((got-ref).norm() / ref.norm().clamp_min(1e-12)).item()
                 ok = bool(torch.isfinite(got).all().item()) and rel <= 0.005
