@@ -47,16 +47,50 @@ class PackedLinear:
             self.fallbacks += 1
             self.reasons["cast_options"] += 1
             return original(x, *args, **kwargs)
-        if getattr(module, "comfy_cast_weights", False) or getattr(module, "_prefetch", None) is not None or getattr(module, "_v", None) is not None:
-            self.fallbacks += 1
-            self.reasons["managed_weight"] += 1
-            return original(x, *args, **kwargs)
         from comfy_kitchen.tensor.int8 import QuantizedTensor
+        from comfy import ops
         w = getattr(module, "weight", None)
+        if (not isinstance(w, QuantizedTensor)
+                or not getattr(module, "_full_precision_mm", False)
+                or getattr(module, "_full_precision_mm_config", False)
+                or getattr(module, "comfy_force_cast_weights", False)
+                or getattr(module, "comfy_force_forward", False)
+                or getattr(module, "weight_function", None) != []
+                or getattr(module, "bias_function", None) != []
+                or getattr(module, "training", False)
+                or getattr(module, "pre_quant_scale", None) is not None
+                or getattr(module, "input_scale", None) is not None
+                or type(x) is not torch.Tensor or x.device.type != "mps"
+                or x.dtype != torch.bfloat16 or x.requires_grad):
+            self.fallbacks += 1
+            self.reasons["module_guard"] += 1
+            return original(x, *args, **kwargs)
+        context = getattr(ops, "CastBiasWeightContext", None)
+        if context is None:
+            self.reasons["missing_context"] += 1
+            self.fallbacks += 1
+            return original(x, *args, **kwargs)
+        try:
+            inspect.signature(ops.cast_bias_weight).bind(module, input=None,
+                dtype=w.dtype, device=x.device, bias_dtype=x.dtype,
+                offloadable=True, compute_dtype=x.dtype, want_requant=True)
+        except (TypeError, ValueError):
+            self.reasons["context_signature"] += 1
+            self.fallbacks += 1
+            return original(x, *args, **kwargs)
+        with context(module, input=None, dtype=w.dtype, device=x.device,
+                     bias_dtype=x.dtype, offloadable=True,
+                     compute_dtype=x.dtype, want_requant=True) as (prepared, bias):
+            result = self.run_prepared(module, x, prepared, bias)
+            if result is not None:
+                return result
+        return original(x, *args, **kwargs)
+
+    def run_prepared(self, module, x, w, b):
+        from comfy_kitchen.tensor.int8 import QuantizedTensor
         p = getattr(w, "_params", None)
         q = getattr(w, "_qdata", None)
         s = getattr(p, "scale", None)
-        b = getattr(module, "bias", None)
         if (self.disabled or type(x) is not torch.Tensor or x.ndim < 2
                 or x.device.type != "mps" or x.dtype != torch.bfloat16 or x.requires_grad
                 or not isinstance(w, QuantizedTensor)
@@ -82,12 +116,12 @@ class PackedLinear:
                 ):
             self.fallbacks += 1
             self.reasons['ineligible'] += 1
-            return original(x, *args, **kwargs)
+            return None
         key = (id(module), id(w), q.data_ptr(), s.data_ptr())
         try:
             if key not in self.checked:
                 sample = x.reshape(-1, x.shape[-1])[:16].contiguous()
-                ref = original(sample, *args, **kwargs).float()
+                ref = F.linear(sample, w.dequantize().to(sample.dtype), b).float()
                 got = self.compute(sample, q, s, b).float()
                 rel = ((got-ref).norm() / ref.norm().clamp_min(1e-12)).item()
                 ok = bool(torch.isfinite(got).all().item()) and rel <= 0.005
@@ -103,7 +137,7 @@ class PackedLinear:
             logging.warning("[H3 Packed] native fallback: %r", exc)
         self.fallbacks += 1
         self.reasons['validation_or_native_failure'] += 1
-        return original(x, *args, **kwargs)
+        return None
 
 @contextmanager
 def packed_scope(root, engine):
