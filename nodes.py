@@ -202,7 +202,7 @@ class H3MPSQuantAccelerator:
     def INPUT_TYPES(cls):
         return {"required": {
             "model": ("MODEL",),
-            "backend": (["observe", "chunked", "convrot_metal", "convrot_direct", "native"], {"default": "observe"}),
+            "backend": (["observe", "chunked", "convrot_metal", "convrot_direct", "native", "int8_packed"], {"default": "observe"}),
             "chunk_mib": ("INT", {"default": 128, "min": 64, "max": 512, "step": 64}),
         }}
 
@@ -225,8 +225,21 @@ class H3MPSQuantAccelerator:
         if backend == "native":
             return (model,)
 
+        from .packed_linear import PackedLinear, packed_scope
+        packed = PackedLinear() if backend == "int8_packed" else None
+
         def wrapper(apply_model, params):
             with lock:
+                if packed is not None:
+                    hits, misses = packed.hits, packed.fallbacks
+                    try:
+                        with packed_scope(patched.get_model_object("diffusion_model"), packed):
+                            if previous is not None:
+                                return previous(apply_model, params)
+                            return apply_model(params["input"], params["timestep"], **params["c"])
+                    finally:
+                        logging.info("[H3 Packed] step hits=%s fallback=%s cumulative_hits=%s",
+                                     packed.hits-hits, packed.fallbacks-misses, packed.hits)
                 if convrot is not None:
                     # No public int8_linear monkeypatch or general operator tracing
                     # in Metal mode. Only intercept the exact ConvRot custom op.
