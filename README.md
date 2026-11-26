@@ -61,3 +61,33 @@ audio/video decode, quality, and repeat-run memory tests.
 Apache-2.0. External projects used for research retain their own licenses; no
 SolAttn source code is vendored here.
 
+
+## Native H3 Ref2VA preflight (A0.1)
+
+Before benchmarking an official or BanZhang H3 workflow, inspect the **actual
+MODEL ancestry of the active sampler**. A SolAttnPatch node that exists in a
+workflow but only feeds a second-stage branch does not accelerate first-stage
+sampling. Likewise, our own profiler/quant nodes must be on that same ancestry
+to contribute measurements or speedups. The node's presence is not proof of a
+runtime hit.
+
+For the 1117 BanZhang macOS workflow, trace `KSampler.model` back through
+`BanZhang_SelfLiftMultiStage` and `CSGlideCastCS`. The supplied 1117 Mac
+variant has a separate SolAttnPatch branch feeding the second-stage model;
+first-stage sampling goes via the unsol-patched dial output. Do not report
+SolAttn first-pass gains for that unmodified workflow.
+
+Keep `backend=observe` for initial H3MPSQuantAccelerator runs and
+`exact_mps_timing=false` for whole-run profiling. Only enable experimental
+Packed INT8 or ConvRot paths after logging eligible/hit/fallback counts,
+checking native operator support and confirming LoRA patching behavior. The
+PackedLinear path deliberately rejects prepared modules with active
+`weight_function` / `bias_function` patch lists; a 263-patch LoRA run may
+therefore have many legitimate fallbacks. Never infer a speedup from node
+placement alone.
+
+For reproducible benchmarks record the model and text encoder file hashes,
+ComfyUI/PyTorch/macOS/Metal versions, first-stage model ancestry, LoRA name
+and patch count, image count, actual frames, sigma schedule, peak MPS memory,
+swap in/out delta, sampler latency and VAE decode latency. Start by comparing
+fixed latent VAE decode variants separately from the costly 4-step sampler.
